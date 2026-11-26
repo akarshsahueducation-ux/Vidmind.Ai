@@ -85,15 +85,44 @@ export default function LoginPage() {
   }
 
   async function handleGoogleLogin() {
+    setErrorMsg("");
+    setStatusMsg("");
     const supabase = createSupabaseBrowserClient();
     if (!supabase) {
       setErrorMsg("Configure Supabase environment variables to enable Google OAuth.");
       return;
     }
-    await supabase.auth.signInWithOAuth({
+
+    try {
+      const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+      const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+      if (url && anonKey) {
+        const settingsRes = await fetch(`${url}/auth/v1/settings`, {
+          headers: { apikey: anonKey },
+        });
+        if (settingsRes.ok) {
+          const settings = (await settingsRes.json()) as {
+            external?: { google?: boolean };
+          };
+          if (!settings.external?.google) {
+            setErrorMsg(
+              "Google Sign-In is not enabled in your Supabase project yet. Use Email + Password above, or enable Google under Supabase Dashboard → Authentication → Providers → Google."
+            );
+            return;
+          }
+        }
+      }
+    } catch {
+      // Proceed to OAuth attempt if settings pre-check is unreachable
+    }
+
+    const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
       options: { redirectTo: `${window.location.origin}/auth/callback?next=/dashboard` },
     });
+    if (error) {
+      setErrorMsg(error.message);
+    }
   }
 
   return (
