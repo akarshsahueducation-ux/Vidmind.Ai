@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { generateStructuredSummary } from "@/lib/ai/pipeline";
+import { extractJsonFromLLM, runLLMCompletion } from "@/lib/ai/provider";
 import {
   inferMediaMimeType,
   isBinaryMediaFile,
@@ -211,29 +212,89 @@ async function runVideoPipeline(
         sourceType = "metadata_fallback";
       }
 
-      if (!segments.length && (existingChapters.length > 0 || description.trim().length > 20)) {
-        const chapterSegs: TranscriptSegment[] = existingChapters.map((ch) => ({
-          start: ch.startSeconds,
-          duration: 30,
-          text: `${ch.title}${ch.summary ? `: ${ch.summary}` : ""}`,
-          timestamp: ch.timestamp,
-        }));
-        const descLines = description
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter((l) => l.length > 15 && !/^https?:\/\//i.test(l))
-          .slice(0, 12)
-          .map((text, idx) => ({
-            start: idx * 30,
+      if (!segments.length) {
+        if (existingChapters.length > 0 || description.trim().length > 20) {
+          const chapterSegs: TranscriptSegment[] = existingChapters.map((ch) => ({
+            start: ch.startSeconds,
             duration: 30,
-            text,
-            timestamp: formatTimestamp(idx * 30),
+            text: `${ch.title}${ch.summary ? `: ${ch.summary}` : ""}`,
+            timestamp: ch.timestamp,
           }));
-        segments = chapterSegs.length ? chapterSegs : descLines;
+          const descLines = description
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l.length > 15 && !/^https?:\/\//i.test(l))
+            .slice(0, 12)
+            .map((text, idx) => ({
+              start: idx * 30,
+              duration: 30,
+              text,
+              timestamp: formatTimestamp(idx * 30),
+            }));
+          segments = chapterSegs.length ? chapterSegs : descLines;
+        }
+
+        if (!segments.length && title && !title.startsWith("YouTube Video (")) {
+          try {
+            emit?.("transcript", 48, "Building AI study breakdown from video topic & metadata...");
+            const synthRes = await runLLMCompletion({
+              systemPrompt:
+                "You are an expert educational content synthesizer. Given a YouTube video's title, channel, and any available metadata, produce a structured, accurate, educational topic breakdown so students can study, quiz, and ask questions.",
+              jsonMode: true,
+              userPrompt: `Video Title: ${title}
+Channel: ${channelName}
+Duration Seconds: ${durationSeconds || 1800}
+Description: ${description.slice(0, 1200) || "Not exposed"}
+Target Language: ${parsed.language}
+
+Return STRICT JSON:
+{
+  "chapters": [{"startSeconds": number, "title": string}],
+  "segments": [{"startSeconds": number, "text": string}]
+}
+Include 8 to 14 chronological study segments covering the core concepts taught in this video.`,
+            });
+            if (synthRes) {
+              const synthJson = extractJsonFromLLM<{
+                chapters?: Array<{ startSeconds?: number; title?: string }>;
+                segments?: Array<{ startSeconds?: number; text?: string }>;
+              }>(synthRes.text);
+              if (Array.isArray(synthJson.segments) && synthJson.segments.length > 0) {
+                segments = synthJson.segments
+                  .filter((s) => s && String(s.text || "").trim())
+                  .map((s) => {
+                    const start = Math.max(0, Number(s.startSeconds || 0));
+                    return {
+                      start,
+                      duration: 45,
+                      text: String(s.text).trim(),
+                      timestamp: formatTimestamp(start),
+                    };
+                  });
+              }
+              if (!existingChapters.length && Array.isArray(synthJson.chapters)) {
+                existingChapters = synthJson.chapters
+                  .filter((c) => c && String(c.title || "").trim())
+                  .map((c) => {
+                    const startSeconds = Math.max(0, Number(c.startSeconds || 0));
+                    return {
+                      startSeconds,
+                      timestamp: formatTimestamp(startSeconds),
+                      title: String(c.title).trim(),
+                      summary: "",
+                    };
+                  });
+              }
+            }
+          } catch {
+            // Fall through gracefully
+          }
+        }
+
         if (segments.length) {
           sourceType = "metadata_fallback";
           customNotice =
-            "Audio stream was too long for live serverless transcription — built AI knowledge base from video chapters and description.";
+            "YouTube blocked direct captions and the video exceeded the live audio transcription window — VidMind AI synthesized a structured study breakdown from the video's title, chapters, and topic context.";
         }
       }
     }
