@@ -32,7 +32,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
           content: { parts: [{ text: input }] },
           outputDimensionality: 1536,
         }),
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(8000),
       });
       if (res.ok) {
         const json = (await res.json()) as { embedding?: { values?: number[] } };
@@ -57,7 +57,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
           model: "text-embedding-3-small",
           input,
         }),
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(8000),
       });
       if (res.ok) {
         const json = (await res.json()) as { data?: Array<{ embedding?: number[] }> };
@@ -76,22 +76,18 @@ export async function embedTranscriptChunks(
   chunks: TranscriptChunk[],
   onProgress?: (done: number, total: number) => void
 ): Promise<TranscriptChunk[]> {
-  // Cap direct inline embedding to 24 chunks for low-latency processing
-  const maxToEmbed = Math.min(chunks.length, 24);
+  // Cap direct inline embedding to 12 chunks in a single parallel batch for low-latency processing
+  const maxToEmbed = Math.min(chunks.length, 12);
+  if (maxToEmbed === 0) return chunks;
   const result = [...chunks];
-  const batchSize = 4;
-
-  for (let i = 0; i < maxToEmbed; i += batchSize) {
-    const slice = result.slice(i, Math.min(i + batchSize, maxToEmbed));
-    const vectors = await Promise.all(slice.map((c) => generateEmbedding(c.content)));
-    slice.forEach((chunk, offset) => {
-      const vec = vectors[offset];
-      if (vec) {
-        result[i + offset] = { ...chunk, embedding: vec };
-      }
-    });
-    if (onProgress) onProgress(Math.min(i + slice.length, maxToEmbed), maxToEmbed);
-  }
-
+  const slice = result.slice(0, maxToEmbed);
+  const vectors = await Promise.all(slice.map((c) => generateEmbedding(c.content)));
+  slice.forEach((chunk, offset) => {
+    const vec = vectors[offset];
+    if (vec) {
+      result[offset] = { ...chunk, embedding: vec };
+    }
+  });
+  if (onProgress) onProgress(maxToEmbed, maxToEmbed);
   return result;
 }

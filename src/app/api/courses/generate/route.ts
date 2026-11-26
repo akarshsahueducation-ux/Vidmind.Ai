@@ -4,6 +4,8 @@ import { generateCourseCurriculum } from "@/lib/ai/pipeline";
 import { buildAdaptiveStudySchedule } from "@/lib/scheduler/engine";
 import type { GeneratedCourse } from "@/types/vidmind";
 
+export const maxDuration = 60;
+
 const CourseRequestSchema = z.object({
   videoId: z.string().min(1),
   title: z.string().min(1),

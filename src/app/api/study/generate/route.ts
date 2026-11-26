@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { generateStudyArtifact } from "@/lib/ai/pipeline";
 
+export const maxDuration = 60;
+
 const StudySchema = z.object({
   kind: z.enum(["notes", "quiz", "flashcards", "mindmap", "presentation", "repurpose"]),
   title: z.string().min(1),

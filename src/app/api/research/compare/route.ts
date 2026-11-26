@@ -3,6 +3,8 @@ import { z } from "zod";
 import { runLLMCompletion, extractJsonFromLLM, sanitizeUntrustedTranscript } from "@/lib/ai/provider";
 import { tokenizeText } from "@/lib/rag/search";
 
+export const maxDuration = 60;
+
 const CompareSchema = z.object({
   videos: z
     .array(

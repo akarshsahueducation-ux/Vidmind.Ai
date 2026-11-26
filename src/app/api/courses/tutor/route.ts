@@ -6,6 +6,8 @@ import {
   sanitizeUntrustedTranscript,
 } from "@/lib/ai/provider";
 
+export const maxDuration = 60;
+
 const TutorSchema = z.object({
   mode: z.enum(["tutor", "diagnostic"]).default("tutor"),
   courseTitle: z.string().default("VidMind Course"),

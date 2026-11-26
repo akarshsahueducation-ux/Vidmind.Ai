@@ -11,6 +11,8 @@ import {
 } from "@/lib/youtube/extractor";
 import type { CourseModule, GeneratedCourse } from "@/types/vidmind";
 
+export const maxDuration = 60;
+
 const PlaylistCourseSchema = z.object({
   playlistUrl: z.string().min(5),
   profile: z.object({

@@ -19,6 +19,7 @@ import {
 import type { ProcessedVideoPayload, TranscriptSegment } from "@/types/vidmind";
 
 const MAX_UPLOAD_BYTES = 120 * 1024 * 1024; // 120 MB limit
+export const maxDuration = 60;
 
 const ProcessSchema = z.object({
   url: z.string().optional().default(""),
@@ -44,6 +45,7 @@ async function runVideoPipeline(
   uploadedMedia?: UploadedMediaPayload | null,
   emit?: (stage: string, pct: number, detail: string) => void
 ): Promise<ProcessedVideoPayload> {
+  const startedAt = Date.now();
   let videoId = `media-${Date.now().toString(36)}`;
   let url = parsed.url.trim();
   let title = parsed.manualTitle.trim() || "Untitled Media Workspace";
@@ -214,11 +216,14 @@ async function runVideoPipeline(
   emit?.("chunking", 55, "Segmenting transcript into timestamped chunks...");
   const rawChunks = chunkTranscript(segments, 650);
 
-  emit?.("embeddings", 68, `Indexing ${rawChunks.length} chunk(s) with vector embeddings...`);
-  const chunks = await embedTranscriptChunks(rawChunks, (done, total) => {
-    const pct = 68 + Math.round((done / Math.max(1, total)) * 14);
-    emit?.("embeddings", pct, `Embedded ${done}/${total} transcript chunks...`);
-  });
+  let chunks = rawChunks;
+  if (rawChunks.length > 0 && Date.now() - startedAt < 40_000) {
+    emit?.("embeddings", 68, `Indexing ${rawChunks.length} chunk(s) with vector embeddings...`);
+    chunks = await embedTranscriptChunks(rawChunks, (done, total) => {
+      const pct = 68 + Math.round((done / Math.max(1, total)) * 14);
+      emit?.("embeddings", pct, `Embedded ${done}/${total} transcript chunks...`);
+    });
+  }
 
   const wordCount = segments
     .map((s) => s.text)

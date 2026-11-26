@@ -389,24 +389,39 @@ export async function fetchYouTubeVideoAndTranscript(
   segments: TranscriptSegment[];
 }> {
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
-  let playerResponse: Record<string, unknown> | null = null;
-
-  try {
-    const res = await fetch(watchUrl, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9",
-        Cookie: "CONSENT=YES+cb.20210328-17-p0.en+FX+667",
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (res.ok) {
-      const html = await res.text();
-      playerResponse = extractBalancedJson(html, "ytInitialPlayerResponse");
-    }
-  } catch {
-    // Fallback to Innertube below
-  }
+  let [playerResponse, oembed] = await Promise.all([
+    (async (): Promise<Record<string, unknown> | null> => {
+      try {
+        const res = await fetch(watchUrl, {
+          headers: {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            Cookie: "CONSENT=YES+cb.20210328-17-p0.en+FX+667",
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (res.ok) {
+          const html = await res.text();
+          return extractBalancedJson(html, "ytInitialPlayerResponse");
+        }
+      } catch {
+        // Fallback to Innertube/oEmbed
+      }
+      return null;
+    })(),
+    (async (): Promise<{ title?: string; author_name?: string }> => {
+      try {
+        const oeRes = await fetch(
+          `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`,
+          { signal: AbortSignal.timeout(6000) }
+        );
+        if (oeRes.ok) return (await oeRes.json()) as { title?: string; author_name?: string };
+      } catch {
+        // Ignore oEmbed failure
+      }
+      return {};
+    })(),
+  ]);
 
   const getTracks = (pr: Record<string, unknown> | null): CaptionTrack[] => {
     const captions = pr?.captions as Record<string, unknown> | undefined;
@@ -418,7 +433,7 @@ export async function fetchYouTubeVideoAndTranscript(
 
   let tracks = getTracks(playerResponse);
 
-  if (!tracks.length) {
+  if (!tracks.length && !playerResponse?.videoDetails) {
     try {
       const innerRes = await fetch(
         "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
@@ -441,7 +456,7 @@ export async function fetchYouTubeVideoAndTranscript(
             },
             videoId,
           }),
-          signal: AbortSignal.timeout(15000),
+          signal: AbortSignal.timeout(8000),
         }
       );
       if (innerRes.ok) {
@@ -453,17 +468,6 @@ export async function fetchYouTubeVideoAndTranscript(
     } catch {
       // Handled gracefully below
     }
-  }
-
-  let oembed: { title?: string; author_name?: string } = {};
-  try {
-    const oeRes = await fetch(
-      `https://www.youtube.com/oembed?url=${encodeURIComponent(watchUrl)}&format=json`,
-      { signal: AbortSignal.timeout(10000) }
-    );
-    if (oeRes.ok) oembed = (await oeRes.json()) as { title?: string; author_name?: string };
-  } catch {
-    // Ignore oEmbed failure
   }
 
   const details = (playerResponse?.videoDetails as Record<string, unknown> | undefined) || {};

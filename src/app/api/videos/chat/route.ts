@@ -3,6 +3,8 @@ import { z } from "zod";
 import { answerVideoQuestionRAG } from "@/lib/ai/pipeline";
 import { checkRateLimit } from "@/lib/rate-limit";
 
+export const maxDuration = 60;
+
 const ChatSchema = z.object({
   question: z.string().min(1).max(1200),
   videoTitle: z.string().default("YouTube Video"),

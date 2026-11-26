@@ -222,43 +222,52 @@ function WorkspaceInner() {
       let buffer = "";
       let processed: ProcessedVideoPayload | null = null;
 
+      const handleStreamLine = (line: string) => {
+        if (!line.trim()) return;
+        const msg = JSON.parse(line) as {
+          type: "progress" | "result" | "error";
+          stage?: string;
+          pct?: number;
+          detail?: string;
+          payload?: ProcessedVideoPayload;
+          error?: string;
+        };
+        if (msg.type === "progress") {
+          setStreamPct(msg.pct || 25);
+          setStreamDetail(msg.detail || "Processing...");
+          const stageMap: Record<string, number> = {
+            metadata: 0,
+            transcript: 1,
+            chunking: 2,
+            embeddings: 2,
+            summarizing: 3,
+          };
+          if (msg.stage && msg.stage in stageMap) setStageIndex(stageMap[msg.stage]);
+        } else if (msg.type === "error") {
+          throw new Error(msg.error || "Processing error.");
+        } else if (msg.type === "result" && msg.payload) {
+          processed = msg.payload;
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const msg = JSON.parse(line) as {
-            type: "progress" | "result" | "error";
-            stage?: string;
-            pct?: number;
-            detail?: string;
-            payload?: ProcessedVideoPayload;
-            error?: string;
-          };
-          if (msg.type === "progress") {
-            setStreamPct(msg.pct || 25);
-            setStreamDetail(msg.detail || "Processing...");
-            const stageMap: Record<string, number> = {
-              metadata: 0,
-              transcript: 1,
-              chunking: 2,
-              embeddings: 2,
-              summarizing: 3,
-            };
-            if (msg.stage && msg.stage in stageMap) setStageIndex(stageMap[msg.stage]);
-          } else if (msg.type === "error") {
-            throw new Error(msg.error || "Processing error.");
-          } else if (msg.type === "result" && msg.payload) {
-            processed = msg.payload;
-          }
-        }
+        for (const line of lines) handleStreamLine(line);
       }
+      if (buffer.trim()) handleStreamLine(buffer);
 
-      if (!processed) throw new Error("Incomplete processing stream.");
+      if (!processed) {
+        throw new Error(
+          "Processing timed out or stream ended early. Try again or use Paste Transcript for long videos."
+        );
+      }
 
       setCurrent(processed);
       setPlayerStart(0);

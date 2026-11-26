@@ -203,7 +203,7 @@ export async function transcribeMediaWithGemini(
 
     const prompt = `Listen to the spoken audio and observe any key on-screen slides/text in this media carefully.
 Your task:
-1. Transcribe the spoken content accurately into chronological segments roughly every 10-20 seconds with exact startSeconds timestamps.
+1. Transcribe/capture the spoken content into 15-32 chronological segments (roughly every 25-45 seconds for longer videos, or 10-15 seconds for short clips) with exact startSeconds timestamps, preserving key quotes, terms, and ideas.
 2. Even if there is NO existing title, caption, or description, infer an accurate, clear inferredTitle, a 2-sentence inferredDescription, speakerOrChannel, and major chapters from what you hear and see.
 3. Target language for output fields (keep spoken quotes faithful, or translate transcript only if requested language "${input.language || "en"}" differs cleanly): "${input.language || "en"}".
 Existing hint title (may be blank or generic): ${JSON.stringify(input.existingTitle || input.fileName || "")}
@@ -220,7 +220,7 @@ Return STRICT JSON matching:
 }`;
 
     const candidateModels = Array.from(
-      new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
+      new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"])
     );
 
     let lastError = "";
@@ -237,14 +237,14 @@ Return STRICT JSON matching:
             systemInstruction: {
               parts: [
                 {
-                  text: "You are an accurate multimodal audio/video transcription engine. Always return clean JSON with accurate chronological timestamps starting near 0.",
+                  text: "You are a fast, accurate multimodal audio/video transcription engine. Always return clean JSON with accurate chronological timestamps starting near 0.",
                 },
               ],
             },
             contents: [{ role: "user", parts: [mediaPart, { text: prompt }] }],
             generationConfig: { responseMimeType: "application/json" },
           }),
-          signal: AbortSignal.timeout(120000),
+          signal: AbortSignal.timeout(input.youtubeUrl ? 32000 : 45000),
         });
 
         if (!res.ok) {

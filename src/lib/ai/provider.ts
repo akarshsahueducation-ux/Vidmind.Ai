@@ -98,7 +98,7 @@ export async function runLLMCompletion(
 
   if (shouldTryGemini && geminiKey) {
     const candidateModels = Array.from(
-      new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
+      new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash-preview"])
     );
     let lastError = "";
 
@@ -118,7 +118,7 @@ export async function runLLMCompletion(
               ? { responseMimeType: "application/json" }
               : undefined,
           }),
-          signal: AbortSignal.timeout(45000),
+          signal: AbortSignal.timeout(25000),
         });
 
         if (!res.ok) {
