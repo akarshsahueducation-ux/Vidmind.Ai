@@ -11,3 +11,6 @@ next-env.d.ts
 coverage/
 .DS_Store
 Thumbs.db
+
+.vercel
+.env*
