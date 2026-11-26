@@ -368,16 +368,17 @@ Return STRICT JSON:
       const cleanSegments = rawSegments
         .map((s) => {
           let sec = Math.round(Number(s.startSeconds ?? start));
-          // Some responses emit relative offsets from 0 when start > 0; normalize only if clearly relative (< end - start) and small
           if (start > 60 && sec < start - 15 && sec <= end - start + 15) {
             sec = start + sec;
           }
           return {
+            rawSec: sec,
             start: Math.max(start, Math.min(end, sec)),
             text: String(s.text || "").trim(),
           };
         })
-        .filter((s) => s.text.length > 0)
+        .filter((s) => s.text.length > 0 && s.rawSec <= end + 20 && s.rawSec >= start - 20)
+        .map(({ start: segStart, text }) => ({ start: segStart, text }))
         .sort((a, b) => a.start - b.start);
 
       if (!cleanSegments.length) continue;

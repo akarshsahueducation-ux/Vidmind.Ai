@@ -60,6 +60,47 @@ function buildListeningWindows(totalSeconds: number): Array<{ start: number; end
   return windows;
 }
 
+async function fetchSliceSingle(
+  url: string,
+  startSeconds: number,
+  endSeconds: number,
+  language: string,
+  existingTitle: string
+): Promise<{
+  ok: boolean;
+  segments: TranscriptSegment[];
+  chapters: VideoChapter[];
+  inferredTitle?: string;
+  speakerOrChannel?: string;
+}> {
+  try {
+    const res = await fetch("/api/videos/transcribe-slice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, startSeconds, endSeconds, language, existingTitle }),
+    });
+    if (!res.ok) {
+      return { ok: false, segments: [], chapters: [] };
+    }
+    const json = (await res.json()) as {
+      sliceComplete?: boolean;
+      segments?: TranscriptSegment[];
+      chapters?: VideoChapter[];
+      inferredTitle?: string;
+      speakerOrChannel?: string;
+    };
+    return {
+      ok: true,
+      segments: Array.isArray(json.segments) ? json.segments : [],
+      chapters: json.chapters || [],
+      inferredTitle: json.inferredTitle,
+      speakerOrChannel: json.speakerOrChannel,
+    };
+  } catch {
+    return { ok: false, segments: [], chapters: [] };
+  }
+}
+
 async function fetchSliceWithRetry(
   url: string,
   startSeconds: number,
@@ -72,41 +113,32 @@ async function fetchSliceWithRetry(
   inferredTitle?: string;
   speakerOrChannel?: string;
 } | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const res = await fetch("/api/videos/transcribe-slice", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, startSeconds, endSeconds, language, existingTitle }),
-      });
-      if (!res.ok) {
-        if (attempt === 0 && [429, 500, 502, 503, 504].includes(res.status)) {
-          await new Promise((r) => setTimeout(r, 1200));
-          continue;
-        }
-        return null;
-      }
-      const json = (await res.json()) as {
-        sliceComplete?: boolean;
-        segments?: TranscriptSegment[];
-        chapters?: VideoChapter[];
-        inferredTitle?: string;
-        speakerOrChannel?: string;
+  const first = await fetchSliceSingle(url, startSeconds, endSeconds, language, existingTitle);
+  if (first.ok && first.segments.length > 0) return first;
+
+  // On failure or empty response, bisect larger windows into two halves for high reliability
+  const span = endSeconds - startSeconds;
+  if (span > 600) {
+    const mid = Math.floor((startSeconds + endSeconds) / 2);
+    const [left, right] = await Promise.all([
+      fetchSliceSingle(url, startSeconds, mid, language, existingTitle),
+      fetchSliceSingle(url, mid, endSeconds, language, existingTitle),
+    ]);
+    const combinedSegs = [...left.segments, ...right.segments];
+    if (combinedSegs.length > 0) {
+      return {
+        segments: combinedSegs,
+        chapters: [...left.chapters, ...right.chapters],
+        inferredTitle: left.inferredTitle || right.inferredTitle,
+        speakerOrChannel: left.speakerOrChannel || right.speakerOrChannel,
       };
-      if (Array.isArray(json.segments) && json.segments.length > 0) {
-        return {
-          segments: json.segments,
-          chapters: json.chapters || [],
-          inferredTitle: json.inferredTitle,
-          speakerOrChannel: json.speakerOrChannel,
-        };
-      }
-      return null;
-    } catch {
-      if (attempt === 0) await new Promise((r) => setTimeout(r, 1000));
     }
+    return null;
   }
-  return null;
+
+  await new Promise((r) => setTimeout(r, 1000));
+  const retry = await fetchSliceSingle(url, startSeconds, endSeconds, language, existingTitle);
+  return retry.segments.length > 0 ? retry : null;
 }
 
 export async function processVideoWithClientPipeline(params: {
