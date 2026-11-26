@@ -7,6 +7,7 @@ import { Badge, Button, Card } from "@/components/ui/primitives";
 import {
   createSupabaseBrowserClient,
   isSupabaseClientConfigured,
+  startGoogleOAuth,
 } from "@/lib/supabase/client";
 
 export default function SignupPage() {
@@ -38,15 +39,26 @@ export default function SignupPage() {
     });
     setLoading(false);
     if (err) {
-      setError(err.message);
+      if (err.message.toLowerCase().includes("already registered")) {
+        setError("An account with this email already exists. Use Sign In instead.");
+      } else {
+        setError(err.message);
+      }
     } else if (data.session) {
       setMessage("Account created and signed in! Opening your dashboard...");
       window.location.href = "/dashboard";
     } else {
       setMessage(
-        "Verification link sent! Open the link in your PC browser (since it redirects to 127.0.0.1:3000) to confirm your account."
+        `Verification link sent! Check your inbox and open the confirmation link to activate your account on ${window.location.origin}.`
       );
     }
+  }
+
+  async function handleGoogleSignup() {
+    setError("");
+    setMessage("");
+    const res = await startGoogleOAuth("/dashboard");
+    if (res.error) setError(res.error);
   }
 
   return (
@@ -137,6 +149,10 @@ export default function SignupPage() {
             {loading ? "Creating account..." : "Create Account"}
           </Button>
         </form>
+
+        <Button variant="secondary" size="md" className="w-full" onClick={handleGoogleSignup}>
+          Continue with Google
+        </Button>
 
         <div className="flex items-center justify-between text-xs text-slate-300 pt-2 border-t border-white/10">
           <Link href="/login" className="text-indigo-300 font-semibold hover:underline">

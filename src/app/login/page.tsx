@@ -17,6 +17,7 @@ import { Badge, Button, Card } from "@/components/ui/primitives";
 import {
   createSupabaseBrowserClient,
   isSupabaseClientConfigured,
+  startGoogleOAuth,
 } from "@/lib/supabase/client";
 
 export default function LoginPage() {
@@ -31,7 +32,11 @@ export default function LoginPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get("error") === "auth_callback_failed") {
-      setErrorMsg("Email confirmation link expired or could not be verified. Request a fresh link or sign in below.");
+      const msg = params.get("message");
+      setErrorMsg(
+        msg ||
+          "Verification link expired or could not be verified. Request a fresh link or sign in below."
+      );
     }
   }, []);
 
@@ -87,42 +92,8 @@ export default function LoginPage() {
   async function handleGoogleLogin() {
     setErrorMsg("");
     setStatusMsg("");
-    const supabase = createSupabaseBrowserClient();
-    if (!supabase) {
-      setErrorMsg("Configure Supabase environment variables to enable Google OAuth.");
-      return;
-    }
-
-    try {
-      const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-      const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-      if (url && anonKey) {
-        const settingsRes = await fetch(`${url}/auth/v1/settings`, {
-          headers: { apikey: anonKey },
-        });
-        if (settingsRes.ok) {
-          const settings = (await settingsRes.json()) as {
-            external?: { google?: boolean };
-          };
-          if (!settings.external?.google) {
-            setErrorMsg(
-              "Google Sign-In is not enabled in your Supabase project yet. Use Email + Password above, or enable Google under Supabase Dashboard → Authentication → Providers → Google."
-            );
-            return;
-          }
-        }
-      }
-    } catch {
-      // Proceed to OAuth attempt if settings pre-check is unreachable
-    }
-
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: `${window.location.origin}/auth/callback?next=/dashboard` },
-    });
-    if (error) {
-      setErrorMsg(error.message);
-    }
+    const res = await startGoogleOAuth("/dashboard");
+    if (res.error) setErrorMsg(res.error);
   }
 
   return (
