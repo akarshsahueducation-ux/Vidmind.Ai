@@ -497,11 +497,11 @@ export async function fetchYouTubeVideoAndTranscript(
       if (translateTo && track.isTranslatable) {
         captionUrl += `${captionUrl.includes("?") ? "&" : "?"}tlang=${encodeURIComponent(translateTo)}`;
       }
-      for (const suffix of ["&fmt=json3", ""]) {
+      for (const suffix of ["&fmt=json3"]) {
         try {
           const capRes = await fetch(captionUrl + suffix, {
             headers: { "User-Agent": USER_AGENT },
-            signal: AbortSignal.timeout(15000),
+            signal: AbortSignal.timeout(4000),
           });
           if (capRes.ok) {
             const raw = await capRes.text();

@@ -176,40 +176,43 @@ async function runVideoPipeline(
     if (segments.length > 0) {
       sourceType = "captions";
     } else {
-      emit?.(
-        "transcript",
-        40,
-        "No YouTube captions available — running automated AI audio transcription fallback..."
-      );
-      try {
-        const transcribed = await transcribeMediaWithGemini({
-          youtubeUrl: url,
-          existingTitle: title,
-          language: parsed.language,
-        });
-        if (transcribed && transcribed.segments.length > 0) {
-          segments = transcribed.segments;
-          if (!title || title.startsWith("YouTube Video (")) {
-            title = transcribed.inferredTitle;
+      const tooLongForLiveAudio = durationSeconds > 1500;
+      if (!tooLongForLiveAudio) {
+        emit?.(
+          "transcript",
+          40,
+          "No YouTube captions available — running automated AI audio transcription fallback..."
+        );
+        try {
+          const transcribed = await transcribeMediaWithGemini({
+            youtubeUrl: url,
+            existingTitle: title,
+            language: parsed.language,
+          });
+          if (transcribed && transcribed.segments.length > 0) {
+            segments = transcribed.segments;
+            if (!title || title.startsWith("YouTube Video (")) {
+              title = transcribed.inferredTitle;
+            }
+            if (!description) {
+              description = transcribed.inferredDescription;
+            }
+            if (!existingChapters.length && transcribed.chapters.length) {
+              existingChapters = transcribed.chapters;
+            }
+            if (!durationSeconds && transcribed.durationEstimateSeconds) {
+              durationSeconds = transcribed.durationEstimateSeconds;
+            }
+            isAutoCaptions = true;
+            sourceType = "audio_transcription";
+            customNotice =
+              "YouTube captions were unavailable for this video — VidMind AI automatically transcribed the audio stream so full notes, flashcards, quizzes, and timestamp search work normally.";
+          } else {
+            sourceType = "metadata_fallback";
           }
-          if (!description) {
-            description = transcribed.inferredDescription;
-          }
-          if (!existingChapters.length && transcribed.chapters.length) {
-            existingChapters = transcribed.chapters;
-          }
-          if (!durationSeconds && transcribed.durationEstimateSeconds) {
-            durationSeconds = transcribed.durationEstimateSeconds;
-          }
-          isAutoCaptions = true;
-          sourceType = "audio_transcription";
-          customNotice =
-            "YouTube captions were unavailable for this video — VidMind AI automatically transcribed the audio stream so full notes, flashcards, quizzes, and timestamp search work normally.";
-        } else {
+        } catch {
           sourceType = "metadata_fallback";
         }
-      } catch {
-        sourceType = "metadata_fallback";
       }
 
       if (!segments.length) {
