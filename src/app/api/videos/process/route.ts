@@ -1,16 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { generateStructuredSummary } from "@/lib/ai/pipeline";
-import { extractJsonFromLLM, runLLMCompletion } from "@/lib/ai/provider";
 import {
   inferMediaMimeType,
   isBinaryMediaFile,
+  probeYouTubeDurationWithGemini,
   transcribeMediaWithGemini,
+  transcribeVideoSliceWithGemini,
 } from "@/lib/ai/transcribe";
 import { embedTranscriptChunks } from "@/lib/rag/embeddings";
 import { checkRateLimit } from "@/lib/rate-limit";
 import {
-  chunkTranscript,
+  chunkTranscriptForTimeline,
   extractYouTubeVideoId,
   fetchYouTubeVideoAndTranscript,
   formatTimestamp,
@@ -33,6 +34,7 @@ const ProcessSchema = z.object({
   level: z.enum(["beginner", "intermediate", "advanced"]).default("intermediate"),
   language: z.string().min(2).max(12).default("en"),
   stream: z.boolean().optional().default(false),
+  allowClientSlicing: z.boolean().optional().default(false),
 });
 
 interface UploadedMediaPayload {
@@ -41,11 +43,27 @@ interface UploadedMediaPayload {
   mimeType: string;
 }
 
+export interface SlicedTranscriptionHandoff {
+  videoId: string;
+  url: string;
+  title: string;
+  channelName: string;
+  description: string;
+  durationSeconds: number;
+  thumbnailUrl: string;
+  language: string;
+  chapters: ProcessedVideoPayload["summary"]["chapters"];
+}
+
+type PipelineOutcome =
+  | { kind: "result"; payload: ProcessedVideoPayload }
+  | { kind: "needs_sliced_transcription"; meta: SlicedTranscriptionHandoff };
+
 async function runVideoPipeline(
   parsed: z.infer<typeof ProcessSchema>,
   uploadedMedia?: UploadedMediaPayload | null,
   emit?: (stage: string, pct: number, detail: string) => void
-): Promise<ProcessedVideoPayload> {
+): Promise<PipelineOutcome> {
   const startedAt = Date.now();
   let videoId = `media-${Date.now().toString(36)}`;
   let url = parsed.url.trim();
@@ -74,7 +92,7 @@ async function runVideoPipeline(
       emit?.(
         "transcript",
         30,
-        "Transcribing speech & inferring title/chapters directly from uploaded media..."
+        "AI actively listening to uploaded media to generate genuine timestamped captions..."
       );
       const transcribed = await transcribeMediaWithGemini({
         fileBytes: uploadedMedia.bytes,
@@ -86,7 +104,7 @@ async function runVideoPipeline(
 
       if (!transcribed || !transcribed.segments.length) {
         throw new VideoExtractionError(
-          "Could not transcribe spoken audio from this uploaded media file. Ensure a Gemini API key is configured and the file contains clear audio.",
+          "Could not transcribe spoken audio from this uploaded media file. Ensure GEMINI_API_KEY is configured and the file has audible speech.",
           422
         );
       }
@@ -101,7 +119,7 @@ async function runVideoPipeline(
       isAutoCaptions = true;
       sourceType = "uploaded_media";
       customNotice =
-        "Transcribed directly from your uploaded video/audio — AI automatically generated timestamps, title, and chapters.";
+        "Genuine speech transcription generated directly from your uploaded media with synced timestamps.";
     } else {
       const textContent = new TextDecoder().decode(uploadedMedia.bytes);
       emit?.("transcript", 25, `Parsing subtitle/text file (${uploadedMedia.fileName})...`);
@@ -157,11 +175,11 @@ async function runVideoPipeline(
     channelName = "Uploaded Transcript";
     sourceType = "user_text";
   } else {
-    emit?.("metadata", 15, "Validating URL & extracting YouTube metadata...");
+    emit?.("metadata", 12, "Validating URL & extracting YouTube metadata...");
     videoId = extractYouTubeVideoId(parsed.url);
     url = `https://www.youtube.com/watch?v=${videoId}`;
 
-    emit?.("transcript", 30, "Checking YouTube captions & chapter markers...");
+    emit?.("transcript", 22, "Checking direct YouTube caption tracks...");
     const fetched = await fetchYouTubeVideoAndTranscript(videoId, parsed.language);
     title = fetched.title;
     channelName = fetched.channelName;
@@ -176,141 +194,115 @@ async function runVideoPipeline(
     if (segments.length > 0) {
       sourceType = "captions";
     } else {
-      const tooLongForLiveAudio = durationSeconds > 1500;
-      if (!tooLongForLiveAudio) {
-        emit?.(
-          "transcript",
-          40,
-          "No YouTube captions available — running automated AI audio transcription fallback..."
+      // No direct YouTube captions exposed: probe exact video length if watch HTML blocked on cloud IP
+      if (!durationSeconds) {
+        emit?.("transcript", 28, "Detecting true full video duration across hours...");
+        durationSeconds = await probeYouTubeDurationWithGemini(url);
+      }
+
+      // If client orchestrator is enabled and video needs multi-slice listening (> 12m), hand off slices to client
+      if (parsed.allowClientSlicing && parsed.stream && durationSeconds > 720) {
+        return {
+          kind: "needs_sliced_transcription",
+          meta: {
+            videoId,
+            url,
+            title,
+            channelName,
+            description,
+            durationSeconds,
+            thumbnailUrl,
+            language,
+            chapters: existingChapters,
+          },
+        };
+      }
+
+      // Single-request or parallel server-slice real audio transcription (strictly genuine audio listening)
+      emit?.(
+        "transcript",
+        40,
+        "No YouTube captions exposed — AI actively listening to video audio for genuine timestamps..."
+      );
+
+      if (durationSeconds > 900) {
+        const sliceCount = Math.min(4, Math.max(2, Math.ceil(durationSeconds / 1800)));
+        const windowSize = Math.ceil(durationSeconds / sliceCount);
+        const sliceResults = await Promise.all(
+          Array.from({ length: sliceCount }, (_, i) => {
+            const s = i * windowSize;
+            const e = Math.min(durationSeconds, (i + 1) * windowSize);
+            return transcribeVideoSliceWithGemini({
+              youtubeUrl: url,
+              startSeconds: s,
+              endSeconds: e,
+              language: parsed.language,
+              existingTitle: title,
+            }).catch(() => null);
+          })
         );
-        try {
-          const transcribed = await transcribeMediaWithGemini({
-            youtubeUrl: url,
-            existingTitle: title,
-            language: parsed.language,
-          });
-          if (transcribed && transcribed.segments.length > 0) {
-            segments = transcribed.segments;
-            if (!title || title.startsWith("YouTube Video (")) {
-              title = transcribed.inferredTitle;
-            }
-            if (!description) {
-              description = transcribed.inferredDescription;
-            }
-            if (!existingChapters.length && transcribed.chapters.length) {
-              existingChapters = transcribed.chapters;
-            }
-            if (!durationSeconds && transcribed.durationEstimateSeconds) {
-              durationSeconds = transcribed.durationEstimateSeconds;
-            }
-            isAutoCaptions = true;
-            sourceType = "audio_transcription";
-            customNotice =
-              "YouTube captions were unavailable for this video — VidMind AI automatically transcribed the audio stream so full notes, flashcards, quizzes, and timestamp search work normally.";
-          } else {
-            sourceType = "metadata_fallback";
+
+        const mergedSegs = sliceResults
+          .flatMap((r) => r?.segments || [])
+          .sort((a, b) => a.start - b.start);
+        const mergedChapters = sliceResults.flatMap((r) => r?.chapters || []);
+
+        if (mergedSegs.length > 0) {
+          segments = mergedSegs;
+          if (!existingChapters.length && mergedChapters.length) {
+            existingChapters = mergedChapters;
           }
-        } catch {
-          sourceType = "metadata_fallback";
+          isAutoCaptions = true;
+          sourceType = "audio_transcription";
+          customNotice = `AI listened across ${sliceCount} video sections (${formatTimestamp(
+            durationSeconds
+          )}) and extracted ${mergedSegs.length} genuine timestamped captions.`;
+        }
+      } else {
+        const transcribed = await transcribeMediaWithGemini({
+          youtubeUrl: url,
+          existingTitle: title,
+          language: parsed.language,
+        }).catch(() => null);
+
+        if (transcribed && transcribed.segments.length > 0) {
+          segments = transcribed.segments;
+          if (!title || title.startsWith("YouTube Video (")) {
+            title = transcribed.inferredTitle;
+          }
+          if (!description) {
+            description = transcribed.inferredDescription;
+          }
+          if (!existingChapters.length && transcribed.chapters.length) {
+            existingChapters = transcribed.chapters;
+          }
+          if (!durationSeconds && transcribed.durationEstimateSeconds) {
+            durationSeconds = transcribed.durationEstimateSeconds;
+          }
+          isAutoCaptions = true;
+          sourceType = "audio_transcription";
+          customNotice =
+            "AI actively listened to the video audio stream and generated genuine timestamped captions.";
         }
       }
 
       if (!segments.length) {
-        if (existingChapters.length > 0 || description.trim().length > 20) {
-          const chapterSegs: TranscriptSegment[] = existingChapters.map((ch) => ({
-            start: ch.startSeconds,
-            duration: 30,
-            text: `${ch.title}${ch.summary ? `: ${ch.summary}` : ""}`,
-            timestamp: ch.timestamp,
-          }));
-          const descLines = description
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .filter((l) => l.length > 15 && !/^https?:\/\//i.test(l))
-            .slice(0, 12)
-            .map((text, idx) => ({
-              start: idx * 30,
-              duration: 30,
-              text,
-              timestamp: formatTimestamp(idx * 30),
-            }));
-          segments = chapterSegs.length ? chapterSegs : descLines;
-        }
-
-        if (!segments.length && title && !title.startsWith("YouTube Video (")) {
-          try {
-            emit?.("transcript", 48, "Building AI study breakdown from video topic & metadata...");
-            const synthRes = await runLLMCompletion({
-              systemPrompt:
-                "You are an expert educational content synthesizer. Given a YouTube video's title, channel, and any available metadata, produce a structured, accurate, educational topic breakdown so students can study, quiz, and ask questions.",
-              jsonMode: true,
-              userPrompt: `Video Title: ${title}
-Channel: ${channelName}
-Duration Seconds: ${durationSeconds || 1800}
-Description: ${description.slice(0, 1200) || "Not exposed"}
-Target Language: ${parsed.language}
-
-Return STRICT JSON:
-{
-  "chapters": [{"startSeconds": number, "title": string}],
-  "segments": [{"startSeconds": number, "text": string}]
-}
-Include 8 to 14 chronological study segments covering the core concepts taught in this video.`,
-            });
-            if (synthRes) {
-              const synthJson = extractJsonFromLLM<{
-                chapters?: Array<{ startSeconds?: number; title?: string }>;
-                segments?: Array<{ startSeconds?: number; text?: string }>;
-              }>(synthRes.text);
-              if (Array.isArray(synthJson.segments) && synthJson.segments.length > 0) {
-                segments = synthJson.segments
-                  .filter((s) => s && String(s.text || "").trim())
-                  .map((s) => {
-                    const start = Math.max(0, Number(s.startSeconds || 0));
-                    return {
-                      start,
-                      duration: 45,
-                      text: String(s.text).trim(),
-                      timestamp: formatTimestamp(start),
-                    };
-                  });
-              }
-              if (!existingChapters.length && Array.isArray(synthJson.chapters)) {
-                existingChapters = synthJson.chapters
-                  .filter((c) => c && String(c.title || "").trim())
-                  .map((c) => {
-                    const startSeconds = Math.max(0, Number(c.startSeconds || 0));
-                    return {
-                      startSeconds,
-                      timestamp: formatTimestamp(startSeconds),
-                      title: String(c.title).trim(),
-                      summary: "",
-                    };
-                  });
-              }
-            }
-          } catch {
-            // Fall through gracefully
-          }
-        }
-
-        if (segments.length) {
-          sourceType = "metadata_fallback";
-          customNotice =
-            "YouTube blocked direct captions and the video exceeded the live audio transcription window — VidMind AI synthesized a structured study breakdown from the video's title, chapters, and topic context.";
-        }
+        throw new VideoExtractionError(
+          "Could not extract YouTube captions or transcribe the audio stream for this video (it may be private, age-restricted, or temporarily rate-limited). Try again, upload the audio/video file, or use Paste Transcript Instead.",
+          422
+        );
       }
     }
   }
 
-  emit?.("chunking", 55, "Segmenting transcript into timestamped chunks...");
-  const rawChunks = chunkTranscript(segments, 650);
+  emit?.("chunking", 62, "Segmenting genuine transcript across full timeline...");
+  const rawChunks = chunkTranscriptForTimeline(segments, 24);
 
   let chunks = rawChunks;
   if (rawChunks.length > 0 && Date.now() - startedAt < 40_000) {
-    emit?.("embeddings", 68, `Indexing ${rawChunks.length} chunk(s) with vector embeddings...`);
+    emit?.("embeddings", 72, `Indexing ${rawChunks.length} chunk(s) with vector embeddings...`);
     chunks = await embedTranscriptChunks(rawChunks, (done, total) => {
-      const pct = 68 + Math.round((done / Math.max(1, total)) * 14);
+      const pct = 72 + Math.round((done / Math.max(1, total)) * 12);
       emit?.("embeddings", pct, `Embedded ${done}/${total} transcript chunks...`);
     });
   }
@@ -321,7 +313,7 @@ Include 8 to 14 chronological study segments covering the core concepts taught i
     .split(/\s+/)
     .filter(Boolean).length;
 
-  emit?.("summarizing", 86, "Synthesizing focused knowledge & takeaways...");
+  emit?.("summarizing", 88, "Synthesizing grounded knowledge & chapters...");
   const { summary, warning } = await generateStructuredSummary({
     title,
     channelName,
@@ -335,25 +327,28 @@ Include 8 to 14 chronological study segments covering the core concepts taught i
   });
 
   return {
-    video: {
-      videoId,
-      url,
-      title,
-      channelName,
-      description,
-      thumbnailUrl,
-      durationSeconds,
-      durationFormatted: durationSeconds ? formatTimestamp(durationSeconds) : "Unknown",
-      language,
-      isAutoCaptions,
-      hasTranscript: segments.length > 0,
-      wordCount,
-      sourceType,
+    kind: "result",
+    payload: {
+      video: {
+        videoId,
+        url,
+        title,
+        channelName,
+        description,
+        thumbnailUrl,
+        durationSeconds,
+        durationFormatted: durationSeconds ? formatTimestamp(durationSeconds) : "Unknown",
+        language,
+        isAutoCaptions,
+        hasTranscript: segments.length > 0,
+        wordCount,
+        sourceType,
+      },
+      summary,
+      transcript: segments,
+      chunks,
+      warning: customNotice || warning,
     },
-    summary,
-    transcript: segments,
-    chunks,
-    warning: customNotice || warning,
   };
 }
 
@@ -391,6 +386,7 @@ export async function POST(req: NextRequest) {
         level: String(formData.get("level") || "intermediate"),
         language: String(formData.get("language") || "en"),
         stream: String(formData.get("stream") || "false") === "true",
+        allowClientSlicing: String(formData.get("allowClientSlicing") || "false") === "true",
       });
     } else {
       const raw = await req.json();
@@ -405,10 +401,14 @@ export async function POST(req: NextRequest) {
             controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
           };
           try {
-            const payload = await runVideoPipeline(parsed, uploadedMedia, (stage, pct, detail) => {
+            const outcome = await runVideoPipeline(parsed, uploadedMedia, (stage, pct, detail) => {
               send({ type: "progress", stage, pct, detail });
             });
-            send({ type: "result", payload });
+            if (outcome.kind === "needs_sliced_transcription") {
+              send({ type: "needs_sliced_transcription", meta: outcome.meta });
+            } else {
+              send({ type: "result", payload: outcome.payload });
+            }
           } catch (err) {
             const message = err instanceof Error ? err.message : "Failed to process video";
             send({ type: "error", error: message });
@@ -425,8 +425,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const payload = await runVideoPipeline(parsed, uploadedMedia);
-    return NextResponse.json(payload);
+    const outcome = await runVideoPipeline(parsed, uploadedMedia);
+    if (outcome.kind === "needs_sliced_transcription") {
+      return NextResponse.json(outcome.meta);
+    }
+    return NextResponse.json(outcome.payload);
   } catch (err) {
     if (err instanceof VideoExtractionError) {
       return NextResponse.json({ error: err.message }, { status: err.statusCode });

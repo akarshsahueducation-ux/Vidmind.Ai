@@ -22,10 +22,12 @@ import {
 import { AppShell } from "@/components/layout/AppShell";
 import { Badge, Button, Card, ProgressRing } from "@/components/ui/primitives";
 import {
+  hydrateWorkspaceFromSupabase,
   loadWorkspaceSnapshot,
   saveGeneratedCourse,
   saveProcessedVideo,
 } from "@/lib/storage/workspace-store";
+import { processVideoWithClientPipeline } from "@/lib/youtube/client-pipeline";
 import type {
   CourseLesson,
   GeneratedCourse,
@@ -72,6 +74,7 @@ function CoursesInner() {
 
   const [generating, setGenerating] = useState(false);
   const [stageIdx, setStageIdx] = useState(0);
+  const [stageDetail, setStageDetail] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
   const [activeLessonStart, setActiveLessonStart] = useState(0);
   const [activeLesson, setActiveLesson] = useState<CourseLesson | null>(null);
@@ -109,19 +112,26 @@ function CoursesInner() {
       setActiveCourse(snap.courses[0]);
       setActiveLesson(snap.courses[0].modules[0]?.lessons[0] || null);
     }
+    void hydrateWorkspaceFromSupabase().then((merged) => {
+      if (merged && merged.videos.length > 0) {
+        setVideos(merged.videos);
+        setSelectedVideoId((prev) => prev || merged.videos[0].video.videoId);
+      }
+    });
   }, [searchParams]);
 
   async function handleGenerateCourse() {
     setErrorMsg("");
     setGenerating(true);
     setStageIdx(0);
-    const timer = setInterval(() => setStageIdx((p) => Math.min(3, p + 1)), 1300);
+    setStageDetail("Starting course pipeline...");
 
     try {
       let source = videos.find((v) => v.video.videoId === selectedVideoId);
 
       // Support pasting a YouTube Playlist URL directly!
       if (directUrl.trim() && /youtube\.com\/playlist\?list=/i.test(directUrl.trim())) {
+        setStageDetail("Extracting playlist videos & building multi-part curriculum...");
         const plRes = await fetch("/api/courses/playlist", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -149,21 +159,19 @@ function CoursesInner() {
         return;
       }
 
-      // Allow creating a course directly from a pasted YouTube link!
+      // Allow creating a course directly from ANY pasted YouTube link (including 3h-50h lectures)!
       if (directUrl.trim()) {
-        const procRes = await fetch("/api/videos/process", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: directUrl.trim(),
-            mode: "detailed",
-            level: knowledgeLevel,
-            language: "en",
-          }),
+        source = await processVideoWithClientPipeline({
+          url: directUrl.trim(),
+          mode: "detailed",
+          focus: "full",
+          level: knowledgeLevel,
+          language: "en",
+          onProgress: (p) => {
+            setStageDetail(p.detail);
+            setStageIdx(p.stage === "metadata" ? 0 : 1);
+          },
         });
-        const procJson = await procRes.json();
-        if (!procRes.ok) throw new Error(procJson.error || "Could not process YouTube URL.");
-        source = procJson as ProcessedVideoPayload;
         const nextSnap = saveProcessedVideo(source);
         setVideos(nextSnap.videos);
         setSelectedVideoId(source.video.videoId);
@@ -175,6 +183,7 @@ function CoursesInner() {
       }
 
       setStageIdx(2);
+      setStageDetail("Architecting structured modules & lessons across full video timeline...");
       const res = await fetch("/api/courses/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -197,6 +206,7 @@ function CoursesInner() {
       });
       const course = (await res.json()) as GeneratedCourse & { error?: string };
       if (!res.ok) throw new Error(course.error || "Failed to generate course");
+      setStageIdx(3);
 
       setActiveCourse(course);
       setActiveLesson(course.modules[0]?.lessons[0] || null);
@@ -208,8 +218,8 @@ function CoursesInner() {
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Course generation failed.");
     } finally {
-      clearInterval(timer);
       setGenerating(false);
+      setStageDetail("");
     }
   }
 
@@ -549,20 +559,27 @@ function CoursesInner() {
           </div>
 
           {generating && (
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2">
-              {BUILD_STAGES.map((label, i) => (
-                <div
-                  key={label}
-                  className={`rounded-xl p-2.5 text-xs border transition-all ${
-                    i <= stageIdx
-                      ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-100"
-                      : "bg-[#070b14] border-slate-800 text-slate-500"
-                  }`}
-                >
-                  <div className="font-mono text-[10px] mb-1">STAGE {i + 1}</div>
-                  {label}
+            <div className="space-y-2.5 pt-2">
+              {stageDetail && (
+                <div className="text-xs font-medium text-cyan-300 bg-cyan-500/10 border border-cyan-500/25 rounded-lg px-3 py-2">
+                  {stageDetail}
                 </div>
-              ))}
+              )}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {BUILD_STAGES.map((label, i) => (
+                  <div
+                    key={label}
+                    className={`rounded-xl p-2.5 text-xs border transition-all ${
+                      i <= stageIdx
+                        ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-100"
+                        : "bg-[#070b14] border-slate-800 text-slate-500"
+                    }`}
+                  >
+                    <div className="font-mono text-[10px] mb-1">STAGE {i + 1}</div>
+                    {label}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 

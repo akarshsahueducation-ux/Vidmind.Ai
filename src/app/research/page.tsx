@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Compass, GitCompare, Loader2 } from "lucide-react";
 import { AppShell } from "@/components/layout/AppShell";
 import { Badge, Button, Card } from "@/components/ui/primitives";
-import { loadWorkspaceSnapshot } from "@/lib/storage/workspace-store";
+import { hydrateWorkspaceFromSupabase, loadWorkspaceSnapshot } from "@/lib/storage/workspace-store";
 import type { ProcessedVideoPayload } from "@/types/vidmind";
 
 interface ComparisonResult {
@@ -20,12 +20,21 @@ export default function ResearchPage() {
   const [videos, setVideos] = useState<ProcessedVideoPayload[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
 
   useEffect(() => {
     const snap = loadWorkspaceSnapshot();
     setVideos(snap.videos);
     setSelectedIds(snap.videos.slice(0, 2).map((v) => v.video.videoId));
+    void hydrateWorkspaceFromSupabase().then((merged) => {
+      if (merged && merged.videos.length > 0) {
+        setVideos(merged.videos);
+        setSelectedIds((prev) =>
+          prev.length >= 2 ? prev : merged.videos.slice(0, 2).map((v) => v.video.videoId)
+        );
+      }
+    });
   }, []);
 
   function toggleVideo(id: string) {
@@ -38,6 +47,7 @@ export default function ResearchPage() {
     const chosen = videos.filter((v) => selectedIds.includes(v.video.videoId));
     if (chosen.length < 2) return;
     setLoading(true);
+    setErrorMsg("");
     try {
       const res = await fetch("/api/research/compare", {
         method: "POST",
@@ -51,7 +61,11 @@ export default function ResearchPage() {
           })),
         }),
       });
-      if (res.ok) setComparison((await res.json()) as ComparisonResult);
+      const json = (await res.json()) as ComparisonResult & { error?: string };
+      if (!res.ok) throw new Error(json.error || "Comparison failed.");
+      setComparison(json);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Comparison failed.");
     } finally {
       setLoading(false);
     }
@@ -76,6 +90,11 @@ export default function ResearchPage() {
               Compare Selected ({selectedIds.length})
             </Button>
           </div>
+          {errorMsg && (
+            <div className="rounded-xl bg-rose-500/10 border border-rose-500/35 p-3 text-xs text-rose-300">
+              {errorMsg}
+            </div>
+          )}
 
           {videos.length < 2 ? (
             <div className="text-sm text-slate-400 py-6 text-center space-y-2">

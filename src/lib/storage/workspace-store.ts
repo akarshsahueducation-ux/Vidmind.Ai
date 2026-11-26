@@ -147,9 +147,25 @@ export async function hydrateWorkspaceFromSupabase(): Promise<WorkspaceSnapshot 
     };
     if (!data.authenticated) return null;
     const local = loadWorkspaceSnapshot();
+    const mergedVideoMap = new Map<string, ProcessedVideoPayload>();
+    for (const v of local.videos) mergedVideoMap.set(v.video.videoId, v);
+    for (const v of data.videos || []) {
+      const existing = mergedVideoMap.get(v.video.videoId);
+      if (!existing || v.transcript.length >= existing.transcript.length) {
+        mergedVideoMap.set(v.video.videoId, {
+          ...v,
+          chunks: v.chunks.length ? v.chunks : existing?.chunks || [],
+          summary: {
+            ...v.summary,
+            topics: v.summary.topics.length ? v.summary.topics : existing?.summary.topics || [],
+            chapters: v.summary.chapters.length ? v.summary.chapters : existing?.summary.chapters || [],
+          },
+        });
+      }
+    }
     const merged: WorkspaceSnapshot = {
       ...local,
-      videos: data.videos && data.videos.length > 0 ? data.videos : local.videos,
+      videos: Array.from(mergedVideoMap.values()).slice(0, 20),
       notes: data.notes && data.notes.length > 0 ? data.notes : local.notes,
     };
     saveWorkspaceSnapshot(merged);

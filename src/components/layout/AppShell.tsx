@@ -21,7 +21,7 @@ import {
   Video,
   X,
 } from "lucide-react";
-import { Badge, cn } from "@/components/ui/primitives";
+import { cn } from "@/components/ui/primitives";
 import { loadWorkspaceSnapshot } from "@/lib/storage/workspace-store";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import type { SystemHealthStatus } from "@/types/vidmind";

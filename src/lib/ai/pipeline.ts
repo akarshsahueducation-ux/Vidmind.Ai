@@ -19,7 +19,7 @@ import {
   sanitizeUntrustedTranscript,
 } from "@/lib/ai/provider";
 import { retrieveHybridTranscript, tokenizeText } from "@/lib/rag/search";
-import { formatTimestamp } from "@/lib/youtube/extractor";
+import { evenSampleItems, formatTimestamp } from "@/lib/youtube/extractor";
 
 function buildDeterministicChapters(
   chunks: TranscriptChunk[],
@@ -223,27 +223,38 @@ export async function generateStructuredSummary(params: {
   }
 
   try {
-    // Hierarchical compression for long videos (> 8 chunks, e.g. 2 to 50+ hour videos)
+    // Parallel hierarchical compression for long videos (> 8 chunks, up to 50+ hour timelines)
     let contextForFinalPrompt = "";
     if (chunks.length > 8) {
-      const batchSize = 6;
-      const chunkSummaries: string[] = [];
-      for (let i = 0; i < chunks.length; i += batchSize) {
-        const batch = chunks.slice(i, i + batchSize);
-        const batchText = sanitizeUntrustedTranscript(
-          batch
-            .map((c) => `[${c.startTimestamp}-${c.endTimestamp}] ${c.content}`)
-            .join("\n\n")
-        ).slice(0, 24000);
-
-        const partial = await runLLMCompletion({
-          systemPrompt:
-            "You condense transcript segments faithfully with exact timestamps. Never invent facts.",
-          userPrompt: `Summarize the core topics, definitions, and timestamps from these video chunks:\n\n${batchText}`,
-        });
-        if (!partial) break;
-        chunkSummaries.push(partial.text);
+      const targetChunks = evenSampleItems(chunks, 24);
+      const batchSize = 4;
+      const batches: TranscriptChunk[][] = [];
+      for (let i = 0; i < targetChunks.length; i += batchSize) {
+        batches.push(targetChunks.slice(i, i + batchSize));
       }
+
+      const chunkSummaries = (
+        await Promise.all(
+          batches.map(async (batch) => {
+            const batchText = sanitizeUntrustedTranscript(
+              batch
+                .map((c) => `[${c.startTimestamp}-${c.endTimestamp}] ${c.content}`)
+                .join("\n\n")
+            ).slice(0, 22000);
+            try {
+              const partial = await runLLMCompletion({
+                systemPrompt:
+                  "You condense transcript segments faithfully preserving exact [MM:SS] or [HH:MM:SS] timestamps across the full timeline. Never invent facts.",
+                userPrompt: `Summarize the core topics, definitions, and timestamps from these video chunks:\n\n${batchText}`,
+              });
+              return partial?.text || "";
+            } catch {
+              return "";
+            }
+          })
+        )
+      ).filter(Boolean);
+
       if (chunkSummaries.length > 0) {
         contextForFinalPrompt = chunkSummaries.join("\n\n");
       }
@@ -251,7 +262,7 @@ export async function generateStructuredSummary(params: {
 
     if (!contextForFinalPrompt) {
       contextForFinalPrompt = sanitizeUntrustedTranscript(
-        chunks
+        evenSampleItems(chunks, 16)
           .map((c) => `[${c.startTimestamp}] ${c.content}`)
           .join("\n\n")
       ).slice(0, 38000);
@@ -451,11 +462,10 @@ export async function generateStudyArtifact(params: {
   }
 
   const sampleContext = sanitizeUntrustedTranscript(
-    targetChunks
-      .slice(0, 12)
+    evenSampleItems(targetChunks, 14)
       .map((c) => `[${c.startTimestamp}] ${c.content}`)
       .join("\n\n")
-  ).slice(0, 32000);
+  ).slice(0, 34000);
 
   const topicInstruction = trimmedTopic
     ? `STRICT TOPIC FOCUS: "${trimmedTopic}". Base ALL items strictly on what the speaker teaches about "${trimmedTopic}" in the excerpts below.`
@@ -628,8 +638,7 @@ export async function generateCourseCurriculum(params: {
   const { title, durationSeconds, chunks, knowledgeLevel } = params;
 
   const sampleOutline = sanitizeUntrustedTranscript(
-    chunks
-      .slice(0, 18)
+    evenSampleItems(chunks, 20)
       .map((c) => `[${c.startTimestamp}-${c.endTimestamp}] ${c.content.slice(0, 380)}`)
       .join("\n")
   );

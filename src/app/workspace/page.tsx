@@ -28,12 +28,14 @@ import { Badge, Button, Card } from "@/components/ui/primitives";
 import { MindMapCanvas } from "@/components/visuals/MindMapCanvas";
 import { NeuralOrb3D } from "@/components/visuals/NeuralOrb3D";
 import {
+  hydrateWorkspaceFromSupabase,
   loadWorkspaceSnapshot,
   saveBookmarkItem,
   saveProcessedVideo,
   saveQuizAttempt,
   saveUserNote,
 } from "@/lib/storage/workspace-store";
+import { processVideoWithClientPipeline } from "@/lib/youtube/client-pipeline";
 import type {
   ChatResponsePayload,
   FlashcardItem,
@@ -57,7 +59,7 @@ type WorkspaceTab =
 
 const STAGES = [
   "1. Metadata & URL",
-  "2. Caption Extraction",
+  "2. Live Audio Listening",
   "3. Semantic Chunking",
   "4. AI Knowledge Build",
 ];
@@ -156,6 +158,13 @@ function WorkspaceInner() {
     } else if (snap.videos.length > 0 && !current) {
       setCurrent(snap.videos[0]);
       setUrlInput(snap.videos[0].video.url);
+    } else {
+      void hydrateWorkspaceFromSupabase().then((merged) => {
+        if (merged && merged.videos.length > 0 && !current) {
+          setCurrent(merged.videos[0]);
+          setUrlInput(merged.videos[0].video.url);
+        }
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -184,57 +193,18 @@ function WorkspaceInner() {
     );
 
     try {
-      let res: Response;
-      if (targetFile) {
-        const fd = new FormData();
-        fd.append("file", targetFile);
-        fd.append("manualTitle", manualTitle.trim());
-        fd.append("mode", mode);
-        fd.append("focus", focus);
-        fd.append("level", level);
-        fd.append("language", language);
-        fd.append("stream", "true");
-        res = await fetch("/api/videos/process", { method: "POST", body: fd });
-      } else {
-        res = await fetch("/api/videos/process", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: targetUrl,
-            manualTranscript: manualMode ? manualTranscript : "",
-            manualTitle: manualMode ? manualTitle : "",
-            mode,
-            focus,
-            level,
-            language,
-            stream: true,
-          }),
-        });
-      }
-
-      if (!res.ok || !res.body) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error((errData as { error?: string }).error || "Failed to process video.");
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let processed: ProcessedVideoPayload | null = null;
-
-      const handleStreamLine = (line: string) => {
-        if (!line.trim()) return;
-        const msg = JSON.parse(line) as {
-          type: "progress" | "result" | "error";
-          stage?: string;
-          pct?: number;
-          detail?: string;
-          payload?: ProcessedVideoPayload;
-          error?: string;
-        };
-        if (msg.type === "progress") {
-          setStreamPct(msg.pct || 25);
-          setStreamDetail(msg.detail || "Processing...");
+      const processed = await processVideoWithClientPipeline({
+        url: targetUrl,
+        file: targetFile,
+        manualTranscript: manualMode ? manualTranscript : "",
+        manualTitle: manualMode ? manualTitle : "",
+        mode,
+        focus,
+        level,
+        language,
+        onProgress: (p) => {
+          setStreamPct(p.pct);
+          setStreamDetail(p.detail);
           const stageMap: Record<string, number> = {
             metadata: 0,
             transcript: 1,
@@ -242,32 +212,9 @@ function WorkspaceInner() {
             embeddings: 2,
             summarizing: 3,
           };
-          if (msg.stage && msg.stage in stageMap) setStageIndex(stageMap[msg.stage]);
-        } else if (msg.type === "error") {
-          throw new Error(msg.error || "Processing error.");
-        } else if (msg.type === "result" && msg.payload) {
-          processed = msg.payload;
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          buffer += decoder.decode();
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) handleStreamLine(line);
-      }
-      if (buffer.trim()) handleStreamLine(buffer);
-
-      if (!processed) {
-        throw new Error(
-          "Processing timed out or stream ended early. Try again or use Paste Transcript for long videos."
-        );
-      }
+          if (p.stage in stageMap) setStageIndex(stageMap[p.stage]);
+        },
+      });
 
       setCurrent(processed);
       setPlayerStart(0);
@@ -305,15 +252,19 @@ function WorkspaceInner() {
           chunks: current.chunks,
         }),
       });
-      const data = (await res.json()) as ChatResponsePayload;
+      const data = (await res.json()) as ChatResponsePayload & { error?: string };
+      if (!res.ok) throw new Error(data.error || "Unable to complete chat request right now.");
       setChatMessages((prev) => [
         ...prev,
         { role: "assistant", text: data.answer, payload: data },
       ]);
-    } catch {
+    } catch (err) {
       setChatMessages((prev) => [
         ...prev,
-        { role: "assistant", text: "Unable to complete chat request right now." },
+        {
+          role: "assistant",
+          text: err instanceof Error ? err.message : "Unable to complete chat request right now.",
+        },
       ]);
     } finally {
       setChatLoading(false);
@@ -389,8 +340,11 @@ function WorkspaceInner() {
         }),
       });
       const json = await res.json();
+      if (!res.ok) throw new Error(json?.error || "Pop-check failed.");
       const firstQ = json?.data?.questions?.[0] as QuizQuestion | undefined;
       if (firstQ) setPopCheck(firstQ);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : "Could not generate Pop-Check.");
     } finally {
       setPopLoading(false);
     }

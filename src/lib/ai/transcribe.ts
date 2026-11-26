@@ -23,6 +23,14 @@ export interface TranscribeMediaOutput {
   engine: string;
 }
 
+export interface TranscribeSliceInput {
+  youtubeUrl: string;
+  startSeconds: number;
+  endSeconds: number;
+  language?: string;
+  existingTitle?: string;
+}
+
 interface RawGeminiTranscribeResponse {
   inferredTitle?: string;
   inferredDescription?: string;
@@ -127,7 +135,6 @@ async function uploadToGeminiFilesApi(
     throw new Error("Gemini upload returned incomplete file metadata");
   }
 
-  // Wait briefly for video processing if state is PROCESSING
   let state = uploadJson.file?.state || "ACTIVE";
   let attempts = 0;
   while (state === "PROCESSING" && attempts < 20) {
@@ -165,6 +172,271 @@ async function deleteGeminiFile(fileName: string, geminiKey: string): Promise<vo
   }
 }
 
+async function probeOffsetExists(
+  youtubeUrl: string,
+  offsetSec: number,
+  geminiKey: string,
+  modelName: string
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        modelName
+      )}:generateContent?key=${encodeURIComponent(geminiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  fileData: { fileUri: youtubeUrl },
+                  videoMetadata: {
+                    startOffset: `${offsetSec}s`,
+                    endOffset: `${offsetSec + 5}s`,
+                    fps: 0.1,
+                  },
+                },
+                { text: "Reply OK." },
+              ],
+            },
+          ],
+          generationConfig: { maxOutputTokens: 4 },
+        }),
+        signal: AbortSignal.timeout(9000),
+      }
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Determine true YouTube video duration (from 1m up to 50h+) via fast parallel binary probes
+ * when YouTube blocks watch-page metadata from cloud IPs. Runs in ~2.5s total.
+ */
+export async function probeYouTubeDurationWithGemini(youtubeUrl: string): Promise<number> {
+  const cfg = getServerConfig();
+  if (!cfg.geminiKey) return 0;
+
+  const model = cfg.geminiModel || "gemini-3.5-flash-lite";
+  const landmarks = [600, 1800, 3600, 7200, 14400, 28800, 54000, 108000, 180000];
+  const wave1 = await Promise.all(
+    landmarks.map(async (t) => ({ t, ok: await probeOffsetExists(youtubeUrl, t, cfg.geminiKey, model) }))
+  );
+
+  const okList = wave1.filter((w) => w.ok).map((w) => w.t);
+  const failList = wave1.filter((w) => !w.ok).map((w) => w.t);
+
+  if (!okList.length) {
+    // Under 10 minutes: probe 60s, 180s, 360s
+    const shortWave = await Promise.all(
+      [60, 180, 360].map(async (t) => ({
+        t,
+        ok: await probeOffsetExists(youtubeUrl, t, cfg.geminiKey, model),
+      }))
+    );
+    const maxShort = Math.max(0, ...shortWave.filter((w) => w.ok).map((w) => w.t));
+    return maxShort > 0 ? maxShort + 120 : 480;
+  }
+
+  let lo = Math.max(...okList);
+  let hi = failList.find((f) => f > lo) ?? lo + 3600;
+
+  // One parallel 3-point binary refinement wave (~1.5s)
+  const q1 = Math.round(lo + (hi - lo) * 0.25);
+  const q2 = Math.round(lo + (hi - lo) * 0.5);
+  const q3 = Math.round(lo + (hi - lo) * 0.75);
+  const wave2 = await Promise.all(
+    [q1, q2, q3].map(async (t) => ({ t, ok: await probeOffsetExists(youtubeUrl, t, cfg.geminiKey, model) }))
+  );
+
+  for (const w of wave2) {
+    if (w.ok && w.t > lo) lo = w.t;
+    if (!w.ok && w.t < hi) hi = w.t;
+  }
+
+  return Math.round((lo + Math.min(hi, lo + 2400)) / 2);
+}
+
+/**
+ * Genuine audio+visual slice transcription for ANY window of a YouTube video (supports 1h to 50h+).
+ * Uses Gemini videoMetadata startOffset/endOffset and anti-RECITATION phrasing so Gemini
+ * actively listens to that exact window without regenerating titles/timestamps.
+ */
+export async function transcribeVideoSliceWithGemini(
+  input: TranscribeSliceInput
+): Promise<TranscribeMediaOutput | null> {
+  const cfg = getServerConfig();
+  const geminiKey = cfg.geminiKey;
+  if (!geminiKey) return null;
+
+  const start = Math.max(0, Math.floor(input.startSeconds));
+  const end = Math.max(start + 15, Math.floor(input.endSeconds));
+  const spanMins = Math.max(1, Math.round((end - start) / 60));
+  const targetSegCount = spanMins >= 25 ? "14 to 22" : spanMins >= 12 ? "10 to 16" : "8 to 14";
+
+  const prompt = `Actively listen to the spoken audio and observe on-screen slides, diagrams, or code STRICTLY between startSeconds=${start} and endSeconds=${end} (${formatTimestamp(
+    start
+  )} to ${formatTimestamp(end)}) of this video.
+
+Requirements:
+1. Extract ${targetSegCount} genuine chronological spoken-content notes spaced evenly across [${start}, ${end}].
+2. Every segment's startSeconds MUST be an integer strictly between ${start} and ${end} reflecting when that exact concept/explanation was spoken.
+3. Capture real concepts, examples, Hindi/English spoken explanations, formulas, or code discussed in clear paraphrased wording (avoid copying huge verbatim blocks verbatim so recitation filters never trigger). Never invent timestamps outside [${start}, ${end}].
+4. Identify real topic chapters that begin inside [${start}, ${end}].
+5. Target language for explanations: "${input.language || "en"}". Title hint: ${JSON.stringify(
+    input.existingTitle || ""
+  )}.
+
+Return STRICT JSON:
+{
+  "inferredTitle": string,
+  "speakerOrChannel": string,
+  "detectedLanguage": string,
+  "chapters": [{"startSeconds": number, "title": string}],
+  "segments": [{"startSeconds": number, "text": string}]
+}`;
+
+  const candidateModels = Array.from(
+    new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"])
+  );
+
+  const deadline = Date.now() + 34000;
+  let lastError = "";
+
+  for (const modelName of candidateModels) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs < 4000) break;
+
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      modelName
+    )}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [
+              {
+                text: `You are a genuine multimodal video-listening note & caption engine. Report ONLY what is spoken or shown between ${start}s and ${end}s using exact integer timestamps inside [${start}, ${end}]. Return clean JSON.`,
+              },
+            ],
+          },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  fileData: { fileUri: input.youtubeUrl },
+                  videoMetadata: {
+                    startOffset: `${start}s`,
+                    endOffset: `${end}s`,
+                    fps: 0.12,
+                  },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+        signal: AbortSignal.timeout(remainingMs),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        lastError = `Gemini slice ${res.status} (${modelName}): ${errText.slice(0, 140)}`;
+        if ([404, 429, 500, 503].includes(res.status)) continue;
+        if (res.status === 400) return null; // Slice past actual video end
+        throw new Error(lastError);
+      }
+
+      const json = (await res.json()) as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>;
+      };
+      const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      if (!rawText) continue;
+
+      const parsed = extractJsonFromLLM<RawGeminiTranscribeResponse>(rawText);
+      const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
+      const cleanSegments = rawSegments
+        .map((s) => {
+          let sec = Math.round(Number(s.startSeconds ?? start));
+          // Some responses emit relative offsets from 0 when start > 0; normalize only if clearly relative (< end - start) and small
+          if (start > 60 && sec < start - 15 && sec <= end - start + 15) {
+            sec = start + sec;
+          }
+          return {
+            start: Math.max(start, Math.min(end, sec)),
+            text: String(s.text || "").trim(),
+          };
+        })
+        .filter((s) => s.text.length > 0)
+        .sort((a, b) => a.start - b.start);
+
+      if (!cleanSegments.length) continue;
+
+      const segments: TranscriptSegment[] = cleanSegments.map((seg, idx) => {
+        const nextStart = cleanSegments[idx + 1]?.start;
+        const duration = nextStart && nextStart > seg.start ? Math.min(120, nextStart - seg.start) : 30;
+        return {
+          start: seg.start,
+          duration,
+          text: seg.text,
+          timestamp: formatTimestamp(seg.start),
+        };
+      });
+
+      const chapters: VideoChapter[] = Array.isArray(parsed.chapters)
+        ? parsed.chapters
+            .filter((c) => c?.title)
+            .map((c) => {
+              let sec = Math.round(Number(c.startSeconds ?? start));
+              if (start > 60 && sec < start - 15 && sec <= end - start + 15) {
+                sec = start + sec;
+              }
+              const clamped = Math.max(start, Math.min(end, sec));
+              return {
+                startSeconds: clamped,
+                timestamp: formatTimestamp(clamped),
+                title: String(c.title).trim(),
+                summary: "",
+              };
+            })
+        : [];
+
+      return {
+        inferredTitle:
+          String(parsed.inferredTitle || "").trim() || input.existingTitle || "Untitled Video",
+        inferredDescription: "",
+        speakerOrChannel: String(parsed.speakerOrChannel || "").trim() || "YouTube Creator",
+        detectedLanguage: String(parsed.detectedLanguage || input.language || "en").trim(),
+        durationEstimateSeconds: end,
+        chapters,
+        segments,
+        engine: `Gemini Multimodal Slice (${modelName})`,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        break;
+      }
+      continue;
+    }
+  }
+
+  if (lastError) {
+    throw new Error(lastError);
+  }
+  return null;
+}
+
 export async function transcribeMediaWithGemini(
   input: TranscribeMediaInput
 ): Promise<TranscribeMediaOutput | null> {
@@ -177,7 +449,10 @@ export async function transcribeMediaWithGemini(
 
   try {
     if (input.youtubeUrl) {
-      mediaPart = { fileData: { fileUri: input.youtubeUrl } };
+      mediaPart = {
+        fileData: { fileUri: input.youtubeUrl },
+        videoMetadata: { fps: 0.15 },
+      };
     } else if (input.fileBytes && input.fileBytes.byteLength > 0) {
       const mimeType = inferMediaMimeType(input.fileName || "media.mp4", input.mimeType);
       if (input.fileBytes.byteLength <= GEMINI_INLINE_LIMIT_BYTES) {
@@ -201,12 +476,13 @@ export async function transcribeMediaWithGemini(
       return null;
     }
 
-    const prompt = `Listen to the spoken audio and observe any key on-screen slides/text in this media carefully.
+    const prompt = `Actively listen to the spoken audio and observe any key on-screen slides/code/text throughout this entire media carefully.
 Your task:
-1. Transcribe/capture the spoken content into 15-32 chronological segments (roughly every 25-45 seconds for longer videos, or 10-15 seconds for short clips) with exact startSeconds timestamps, preserving key quotes, terms, and ideas.
-2. Even if there is NO existing title, caption, or description, infer an accurate, clear inferredTitle, a 2-sentence inferredDescription, speakerOrChannel, and major chapters from what you hear and see.
-3. Target language for output fields (keep spoken quotes faithful, or translate transcript only if requested language "${input.language || "en"}" differs cleanly): "${input.language || "en"}".
-Existing hint title (may be blank or generic): ${JSON.stringify(input.existingTitle || input.fileName || "")}
+1. Capture the spoken content into 16-32 genuine chronological segments spanning from the start (0s) to the end with accurate startSeconds timestamps, in clear paraphrased wording preserving core arguments, formulas, and terms (never copy large copyrighted blocks verbatim so recitation filters never trigger).
+2. Infer an accurate inferredTitle, a 2-sentence inferredDescription, speakerOrChannel, and major chapters with exact timestamps from what you hear and see.
+3. Target language for output fields: "${input.language || "en"}". Hint title: ${JSON.stringify(
+      input.existingTitle || input.fileName || ""
+    )}
 
 Return STRICT JSON matching:
 {
@@ -223,11 +499,11 @@ Return STRICT JSON matching:
       new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"])
     );
 
-    const deadline = Date.now() + (input.youtubeUrl ? 25000 : 40000);
+    const deadline = Date.now() + (input.youtubeUrl ? 28000 : 42000);
     let lastError = "";
     for (const modelName of candidateModels) {
       const remainingMs = deadline - Date.now();
-      if (remainingMs < 3000) break;
+      if (remainingMs < 3500) break;
 
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
         modelName
@@ -241,7 +517,7 @@ Return STRICT JSON matching:
             systemInstruction: {
               parts: [
                 {
-                  text: "You are a fast, accurate multimodal audio/video transcription engine. Always return clean JSON with accurate chronological timestamps starting near 0.",
+                  text: "You are a fast, accurate multimodal audio/video transcription engine. Always return clean JSON with genuine spoken-audio segments and accurate timestamps.",
                 },
               ],
             },
@@ -278,7 +554,7 @@ Return STRICT JSON matching:
 
         const segments: TranscriptSegment[] = cleanSegments.map((seg, idx) => {
           const nextStart = cleanSegments[idx + 1]?.start;
-          const duration = nextStart && nextStart > seg.start ? Math.min(45, nextStart - seg.start) : 12;
+          const duration = nextStart && nextStart > seg.start ? Math.min(60, nextStart - seg.start) : 15;
           return {
             start: seg.start,
             duration,

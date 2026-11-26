@@ -1,6 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { GeneratedCourse, ProcessedVideoPayload } from "@/types/vidmind";
+import { chunkTranscriptForTimeline, formatTimestamp } from "@/lib/youtube/extractor";
+import type { GeneratedCourse, ProcessedVideoPayload, TranscriptSegment } from "@/types/vidmind";
+
+function mapDbSourceTypeToUi(
+  dbSource: unknown
+): ProcessedVideoPayload["video"]["sourceType"] {
+  if (dbSource === "transcription") return "audio_transcription";
+  if (dbSource === "uploaded") return "uploaded_media";
+  if (dbSource === "user_text") return "user_text";
+  return "captions";
+}
+
+function mapUiSourceTypeToDb(
+  uiSource: ProcessedVideoPayload["video"]["sourceType"]
+): "captions" | "user_text" | "uploaded" | "transcription" {
+  if (uiSource === "audio_transcription") return "transcription";
+  if (uiSource === "uploaded_media") return "uploaded";
+  if (uiSource === "user_text") return "user_text";
+  return "captions";
+}
 
 /**
  * Supabase Postgres Library Sync Endpoint.
@@ -44,7 +63,8 @@ export async function GET() {
     const videos: ProcessedVideoPayload[] = (videosRes.data || []).map((v) => {
       const sum = summaryByVideo.get(v.id);
       const tr = transcriptByVideo.get(v.id);
-      const segs = Array.isArray(tr?.segments) ? tr.segments : [];
+      const segs = Array.isArray(tr?.segments) ? (tr.segments as TranscriptSegment[]) : [];
+      const rebuiltChunks = chunkTranscriptForTimeline(segs, 24);
       return {
         video: {
           videoId: v.youtube_video_id,
@@ -54,14 +74,12 @@ export async function GET() {
           description: v.description || "",
           thumbnailUrl: v.thumbnail_url || "",
           durationSeconds: v.duration_seconds || 0,
-          durationFormatted: `${Math.floor((v.duration_seconds || 0) / 60)}:${String(
-            (v.duration_seconds || 0) % 60
-          ).padStart(2, "0")}`,
+          durationFormatted: formatTimestamp(v.duration_seconds || 0),
           language: v.language || "en",
           isAutoCaptions: Boolean(tr?.is_auto_generated),
           hasTranscript: segs.length > 0,
           wordCount: Number(tr?.word_count || 0),
-          sourceType: (tr?.source_type as "captions" | "user_text" | "metadata_fallback") || "captions",
+          sourceType: mapDbSourceTypeToUi(tr?.source_type),
         },
         summary: {
           mode: (sum?.mode as "quick" | "detailed" | "learning") || "quick",
@@ -77,7 +95,7 @@ export async function GET() {
           chapters: [],
         },
         transcript: segs,
-        chunks: [],
+        chunks: rebuiltChunks,
       };
     });
 
@@ -163,7 +181,7 @@ export async function POST(req: NextRequest) {
 
       await supabase.from("transcripts").insert({
         video_id: videoRow.id,
-        source_type: vp.video.sourceType === "metadata_fallback" ? "captions" : vp.video.sourceType,
+        source_type: mapUiSourceTypeToDb(vp.video.sourceType),
         language: vp.video.language,
         is_auto_generated: vp.video.isAutoCaptions,
         word_count: vp.video.wordCount,

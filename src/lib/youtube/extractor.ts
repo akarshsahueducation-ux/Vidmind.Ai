@@ -374,6 +374,46 @@ export function chunkTranscript(
   return chunks;
 }
 
+export function evenSampleItems<T>(items: T[], maxItems: number): T[] {
+  if (items.length <= maxItems || maxItems <= 0) return items;
+  const sampled: T[] = [];
+  const step = (items.length - 1) / Math.max(1, maxItems - 1);
+  for (let i = 0; i < maxItems; i++) {
+    sampled.push(items[Math.round(i * step)]);
+  }
+  return sampled;
+}
+
+export function chunkTranscriptForTimeline(
+  segments: TranscriptSegment[],
+  maxChunks = 24
+): TranscriptChunk[] {
+  if (!segments.length) return [];
+  const totalWords = segments.reduce(
+    (sum, s) => sum + s.text.split(/\s+/).filter(Boolean).length,
+    0
+  );
+  const wordsPerChunk = Math.max(120, Math.ceil(totalWords / Math.max(1, maxChunks)));
+  return chunkTranscript(segments, wordsPerChunk);
+}
+
+function parseDurationFromHtml(html: string): number {
+  const lenMatch = /"lengthSeconds":"(\d+)"/.exec(html);
+  if (lenMatch) return Number(lenMatch[1]) || 0;
+  const msMatch = /"approxDurationMs":"(\d+)"/.exec(html);
+  if (msMatch) return Math.round(Number(msMatch[1]) / 1000) || 0;
+  const isoMatch =
+    /<meta\s+itemprop="duration"\s+content="PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"/i.exec(html);
+  if (isoMatch) {
+    return (
+      Number(isoMatch[1] || 0) * 3600 +
+      Number(isoMatch[2] || 0) * 60 +
+      Number(isoMatch[3] || 0)
+    );
+  }
+  return 0;
+}
+
 export async function fetchYouTubeVideoAndTranscript(
   videoId: string,
   preferredLang = "en"
@@ -389,8 +429,12 @@ export async function fetchYouTubeVideoAndTranscript(
   segments: TranscriptSegment[];
 }> {
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
-  let [playerResponse, oembed] = await Promise.all([
-    (async (): Promise<Record<string, unknown> | null> => {
+  const [watchResult, oembed] = await Promise.all([
+    (async (): Promise<{
+      pr: Record<string, unknown> | null;
+      durationFallback: number;
+      apiKey: string;
+    }> => {
       try {
         const res = await fetch(watchUrl, {
           headers: {
@@ -402,12 +446,16 @@ export async function fetchYouTubeVideoAndTranscript(
         });
         if (res.ok) {
           const html = await res.text();
-          return extractBalancedJson(html, "ytInitialPlayerResponse");
+          return {
+            pr: extractBalancedJson(html, "ytInitialPlayerResponse"),
+            durationFallback: parseDurationFromHtml(html),
+            apiKey: /"INNERTUBE_API_KEY":"([^"]+)"/.exec(html)?.[1] || "",
+          };
         }
       } catch {
         // Fallback to Innertube/oEmbed
       }
-      return null;
+      return { pr: null, durationFallback: 0, apiKey: "" };
     })(),
     (async (): Promise<{ title?: string; author_name?: string }> => {
       try {
@@ -423,6 +471,9 @@ export async function fetchYouTubeVideoAndTranscript(
     })(),
   ]);
 
+  let playerResponse = watchResult.pr;
+  const htmlDuration = watchResult.durationFallback;
+
   const getTracks = (pr: Record<string, unknown> | null): CaptionTrack[] => {
     const captions = pr?.captions as Record<string, unknown> | undefined;
     const renderer = captions?.playerCaptionsTracklistRenderer as
@@ -435,30 +486,32 @@ export async function fetchYouTubeVideoAndTranscript(
 
   if (!tracks.length && !playerResponse?.videoDetails) {
     try {
-      const innerRes = await fetch(
-        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent":
-              "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
-          },
-          body: JSON.stringify({
-            context: {
-              client: {
-                clientName: "ANDROID",
-                clientVersion: "19.09.37",
-                androidSdkVersion: 30,
-                hl: "en",
-                gl: "US",
-              },
+      const innerEndpoint = watchResult.apiKey
+        ? `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(
+            watchResult.apiKey
+          )}&prettyPrint=false`
+        : "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+      const innerRes = await fetch(innerEndpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent":
+            "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: "ANDROID",
+              clientVersion: "19.09.37",
+              androidSdkVersion: 30,
+              hl: "en",
+              gl: "US",
             },
-            videoId,
-          }),
-          signal: AbortSignal.timeout(8000),
-        }
-      );
+          },
+          videoId,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
       if (innerRes.ok) {
         const innerJson = (await innerRes.json()) as Record<string, unknown>;
         if (!playerResponse) playerResponse = innerJson;
@@ -474,7 +527,7 @@ export async function fetchYouTubeVideoAndTranscript(
   const title = String(details.title || oembed.title || `YouTube Video (${videoId})`);
   const channelName = String(details.author || oembed.author_name || "YouTube Channel");
   const description = String(details.shortDescription || "");
-  const durationSeconds = Number(details.lengthSeconds || 0);
+  const durationSeconds = Number(details.lengthSeconds || htmlDuration || 0);
   const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
   if (!playerResponse && !oembed.title) {

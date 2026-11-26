@@ -7,6 +7,7 @@ import { AppShell } from "@/components/layout/AppShell";
 import { Badge, Button, Card } from "@/components/ui/primitives";
 import { MindMapCanvas } from "@/components/visuals/MindMapCanvas";
 import {
+  hydrateWorkspaceFromSupabase,
   loadWorkspaceSnapshot,
   saveWorkspaceSnapshot,
   type SavedNote,
@@ -21,6 +22,9 @@ export default function LibraryPage() {
 
   useEffect(() => {
     setSnap(loadWorkspaceSnapshot());
+    void hydrateWorkspaceFromSupabase().then((merged) => {
+      if (merged) setSnap(merged);
+    });
   }, []);
 
   const q = query.trim().toLowerCase();

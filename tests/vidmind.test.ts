@@ -6,6 +6,8 @@ import { retrieveRelevantTranscript } from "../src/lib/rag/search";
 import { inferMediaMimeType, isBinaryMediaFile } from "../src/lib/ai/transcribe";
 import {
   chunkTranscript,
+  chunkTranscriptForTimeline,
+  evenSampleItems,
   extractPlaylistId,
   extractYouTubeVideoId,
   formatTimestamp,
@@ -167,4 +169,22 @@ test("media detection identifies binary video/audio vs subtitle text formats", (
   assert.equal(isBinaryMediaFile("transcript.txt", "text/plain"), false);
   assert.equal(inferMediaMimeType("clip.webm"), "video/webm");
   assert.equal(inferMediaMimeType("recording.mp3"), "audio/mpeg");
+});
+
+test("multi-hour timeline chunking and even sampling cover full 10h-50h span", () => {
+  const segs = Array.from({ length: 120 }, (_, i) => ({
+    start: i * 1500, // spans up to 50 hours (180,000s)
+    duration: 300,
+    text: `Segment ${i} covering topic ${i} with sample explanation words and detailed examples.`,
+    timestamp: formatTimestamp(i * 1500),
+  }));
+  const chunks = chunkTranscriptForTimeline(segs, 24);
+  assert.ok(chunks.length >= 6 && chunks.length <= 24);
+  assert.equal(chunks[0].startSeconds, 0);
+  assert.ok(chunks[chunks.length - 1].startSeconds >= 100000);
+
+  const sampled = evenSampleItems(chunks, 6);
+  assert.equal(sampled.length, 6);
+  assert.equal(sampled[0].index, chunks[0].index);
+  assert.equal(sampled[5].index, chunks[chunks.length - 1].index);
 });
