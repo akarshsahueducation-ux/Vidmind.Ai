@@ -223,8 +223,12 @@ Return STRICT JSON matching:
       new Set([cfg.geminiModel, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"])
     );
 
+    const deadline = Date.now() + (input.youtubeUrl ? 25000 : 40000);
     let lastError = "";
     for (const modelName of candidateModels) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs < 3000) break;
+
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
         modelName
       )}:generateContent?key=${encodeURIComponent(geminiKey)}`;
@@ -244,7 +248,7 @@ Return STRICT JSON matching:
             contents: [{ role: "user", parts: [mediaPart, { text: prompt }] }],
             generationConfig: { responseMimeType: "application/json" },
           }),
-          signal: AbortSignal.timeout(input.youtubeUrl ? 32000 : 45000),
+          signal: AbortSignal.timeout(remainingMs),
         });
 
         if (!res.ok) {
@@ -320,6 +324,9 @@ Return STRICT JSON matching:
         };
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
+        if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+          break;
+        }
         continue;
       }
     }

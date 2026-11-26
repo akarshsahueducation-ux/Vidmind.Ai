@@ -210,6 +210,32 @@ async function runVideoPipeline(
       } catch {
         sourceType = "metadata_fallback";
       }
+
+      if (!segments.length && (existingChapters.length > 0 || description.trim().length > 20)) {
+        const chapterSegs: TranscriptSegment[] = existingChapters.map((ch) => ({
+          start: ch.startSeconds,
+          duration: 30,
+          text: `${ch.title}${ch.summary ? `: ${ch.summary}` : ""}`,
+          timestamp: ch.timestamp,
+        }));
+        const descLines = description
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 15 && !/^https?:\/\//i.test(l))
+          .slice(0, 12)
+          .map((text, idx) => ({
+            start: idx * 30,
+            duration: 30,
+            text,
+            timestamp: formatTimestamp(idx * 30),
+          }));
+        segments = chapterSegs.length ? chapterSegs : descLines;
+        if (segments.length) {
+          sourceType = "metadata_fallback";
+          customNotice =
+            "Audio stream was too long for live serverless transcription — built AI knowledge base from video chapters and description.";
+        }
+      }
     }
   }
 
